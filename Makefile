@@ -25,7 +25,7 @@ INCLUDES	:=  lwbt
 # options for code generation
 #---------------------------------------------------------------------------------
 
-CFLAGS	= -g -O2 -Wall $(MACHDEP) $(INCLUDE)
+CFLAGS	= -g -O2 -fno-strict-aliasing -Wall $(MACHDEP) $(INCLUDE)
 CXXFLAGS	=	$(CFLAGS)
 
 LDFLAGS	=	-g $(MACHDEP) -Wl,-Map,$(notdir $@).map
@@ -33,7 +33,7 @@ LDFLAGS	=	-g $(MACHDEP) -Wl,-Map,$(notdir $@).map
 #---------------------------------------------------------------------------------
 # any extra libraries we wish to link with the project
 #---------------------------------------------------------------------------------
-LIBS	:=	-logc -lm
+LIBS	:=	-lwiiuse -lbte -logc -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -85,9 +85,6 @@ export HFILES := $(addsuffix .h,$(subst .,_,$(BINFILES)))
 export INCLUDE	:=	$(foreach dir,$(INCLUDES), -iquote $(CURDIR)/$(dir)) \
 					$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
 					-I$(CURDIR)/$(BUILD) \
-					-I$(CURDIR)/../libogc/libogc \
-					-I$(CURDIR)/../libogc/gc/ogc \
-					-I$(CURDIR)/../libogc/gc/ogc/machine \
 					-I$(LIBOGC_INC)
 
 #---------------------------------------------------------------------------------

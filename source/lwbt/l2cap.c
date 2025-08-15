@@ -204,7 +204,7 @@ err_t l2cap_write(struct bd_addr *bdaddr, struct pbuf *p, u16_t len)
 				i += outsize;
 			}
 			pb = L2CAP_ACL_CONT;
-			LOG("l2cap_write: FRAG (%d > %d)\n", len, maxsize);
+			LOG("l2cap_write: FRAG\n");
 		} else {
 			ret = lp_acl_write(bdaddr, q, len, pb);
 			len = 0;
@@ -362,20 +362,15 @@ void l2cap_process_sig(struct pbuf *q, struct l2cap_hdr *l2caphdr, struct bd_add
 				}
 				break;
 			case L2CAP_CONN_RSP:
-				if ((((u8_t *)p->payload)[5] == 'S' && ((u8_t *)p->payload)[4] == '0') ||
-					(((u8_t *)p->payload)[5] == 'G' && ((u8_t *)p->payload)[4] == 'D'))
-				{
+				if(pcb == NULL) {
+					result = le16toh(((u16_t *)p->payload)[2]);
 					LOG("l2cap_process_sig: I blue myself");
 					for(pcb = l2cap_active_pcbs; pcb != NULL; pcb = pcb->next) {
 						if(pcb->psm == SDP_PSM) {
-							L2CA_ACTION_BLUEBOMB(pcb, ret);
+							L2CA_ACTION_BLUEBOMB(pcb, result, sighdr->id, ret);
 							break;
 						}
 					}
-					break;
-				}
-			
-				if(pcb == NULL) {
 					/* A response without a matching request is silently discarded */
 					break;
 				}
@@ -1373,7 +1368,7 @@ err_t l2ca_ping(struct bd_addr *bdaddr, struct l2cap_pcb *tpcb,
 }
 
 void l2ca_bluebomb(struct l2cap_pcb *tpcb,
-	  err_t (* l2ca_bluebomb)(void))
+	  err_t (* l2ca_bluebomb)(void *arg, struct l2cap_pcb *lpcb, u16_t resp, u8_t id))
 {
 	tpcb->l2ca_bluebomb = l2ca_bluebomb;
 

@@ -183,7 +183,7 @@ struct l2cap_pcb {
 	/* Upper layer to L2CAP confirmation functions */
 
 	/* Function to be called when a connection has been set up */
-	err_t (* l2ca_bluebomb)(void);
+	err_t (* l2ca_bluebomb)(void *arg, struct l2cap_pcb *pcb, u16_t resp, u8_t id);
 	/* Function to be called when a connection has been set up */
 	err_t (* l2ca_connect_cfm)(void *arg, struct l2cap_pcb *pcb, u16_t result, u16_t status);
 	/* Function to be called when a connection has been closed */
@@ -251,10 +251,10 @@ err_t l2cap_connect_ind(struct l2cap_pcb *npcb, struct bd_addr *bdaddr, u16_t ps
 
 void (*l2cap_disconnect_bb(void (*l2ca_disconnect_bb)(struct bd_addr *bdaddr,u8_t reason)))(struct bd_addr *bdaddr,u8_t reason);
 
-void l2ca_bluebomb(struct l2cap_pcb *tpcb, err_t (* l2ca_bluebomb)(void));
+void l2ca_bluebomb(struct l2cap_pcb *tpcb, err_t (* l2ca_bluebomb)(void *arg, struct l2cap_pcb *lpcb, u16_t resp, u8_t id));
 
 /* Internal functions and global variables */
-#define L2CA_ACTION_BLUEBOMB(pcb,ret) if((pcb)->l2ca_bluebomb != NULL) (ret = (pcb)->l2ca_bluebomb())
+#define L2CA_ACTION_BLUEBOMB(pcb,result,id,ret) if((pcb)->l2ca_bluebomb != NULL) (ret = (pcb)->l2ca_bluebomb((pcb)->callback_arg,(pcb),(result),(id)))
 #define L2CA_ACTION_CONN_CFM(pcb,result,status,ret) if((pcb)->l2ca_connect_cfm != NULL) (ret = (pcb)->l2ca_connect_cfm((pcb)->callback_arg,(pcb),(result),(status)))
 #define L2CA_ACTION_DISCONN_CFM(pcb,ret) if((pcb)->l2ca_disconnect_cfm != NULL) (ret = (pcb)->l2ca_disconnect_cfm((pcb)->callback_arg,(pcb)))
 #define L2CA_ACTION_PING_CFM(pcb,result,ret) if((pcb)->l2ca_pong != NULL) (ret = (pcb)->l2ca_pong((pcb)->callback_arg,(pcb),(result)))
