@@ -1,11 +1,12 @@
 #include <gccore.h>
+#include <ogc/lwp.h>
+#include <stdio.h>
 
 #include "bluetooth.h"
 #include "hci.h"
 #include "btmemb.h"
 #include "physbusif.h"
-
-#define STACKSIZE						32768
+#include "l2cap.h"
 
 struct bt_state
 {
@@ -83,7 +84,7 @@ static err_t __bt_shutdown_finished(void *arg,struct hci_pcb *pcb,u8_t ogf,u8_t 
 	else
 		err = ERR_CONN;
 
-	physbusif_close();
+	physbusif_shutdown();
 	return __bt_cmdfinish(state,err);
 }
 
@@ -92,8 +93,6 @@ void BT_Shutdown(void)
 	u32 level;
 
 	if(btstate.hci_inited==0) return;
-
-	LOG("BT_Shutdown()\n");
 
 	_CPU_ISR_Disable(level);
 	SYS_RemoveAlarm(btstate.timer_svc);
@@ -107,7 +106,7 @@ void BT_Shutdown(void)
 	LWP_CloseQueue(btstate.hci_cmdq);
 	_CPU_ISR_Restore(level);
 
-	physbusif_shutdown();
+	physbusif_close();
 }
 
 err_t bt_hci_initcore_complete(void *arg,struct hci_pcb *pcb,u8_t ogf,u8_t ocf,u8_t result)
@@ -201,7 +200,7 @@ err_t bt_hci_initcore_complete(void *arg,struct hci_pcb *pcb,u8_t ogf,u8_t ocf,u
 			}
 			break;
 		default:
-			LOG("Unknown command complete event. OGF = 0x%x OCF = 0x%x\n", ogf, ocf);
+			fprintf(stderr, "Error initializing Bluetooth subsystem. OGF = 0x%x OCF = 0x%x\n", ogf, ocf);
 			err = ERR_CONN;
 			break;
 	}
@@ -222,6 +221,7 @@ void BT_Init(btecallback cb, struct l2cap_pcb **pcbptr)
 	l2cap_init();
 	physbusif_init();
 
+	LWP_InitQueue(&btstate.hci_cmdq);
 	SYS_CreateAlarm(&btstate.timer_svc);
 
 	_CPU_ISR_Disable(level);
@@ -229,6 +229,7 @@ void BT_Init(btecallback cb, struct l2cap_pcb **pcbptr)
 	hci_reset_all();
 	l2cap_reset_all();
 	physbusif_reset_all();
+	_CPU_ISR_Restore(level);
 
 	btstate.cb = cb;
 	btstate.usrdata = (void *)pcbptr;
@@ -236,6 +237,4 @@ void BT_Init(btecallback cb, struct l2cap_pcb **pcbptr)
 	hci_arg(&btstate);
 	hci_cmd_complete(bt_hci_initcore_complete);
 	hci_reset();
-
-	_CPU_ISR_Restore(level);
 }

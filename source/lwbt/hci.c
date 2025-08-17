@@ -1982,6 +1982,13 @@ static void hci_conn_complete_evt(struct pbuf *p)
 				lp_connect_cfm(bdaddr,((u8_t*)p->payload)[10],ERR_CONN);
 			}
 			break;
+		case HCI_CONN_TERMINATED_BY_LOCAL_HOST:
+			ERROR("hci_conn_complete_evt: Connection terminated by local host\n");
+			if(link!=NULL) {
+				hci_close(link);
+				lp_connect_cfm(bdaddr,((u8_t*)p->payload)[10],ERR_CONN);
+			}
+			break;
 		default:
 			ERROR("hci_conn_complete_evt: Unknown error %d\n", ((u8_t*)p->payload)[0]);
 			if(link!=NULL) {
@@ -2172,7 +2179,7 @@ void hci_event_handler(struct pbuf *p)
 		case HCI_COMMAND_COMPLETE:
 			hci_dev->num_cmd += ((u8_t*)p->payload)[0];
 			btpbuf_header(p,-1);
-			
+
 			opc = le16toh(((u16_t*)p->payload)[0]);
 			ocf = (opc&0x03ff);
 			ogf = (opc>>10);
