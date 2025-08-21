@@ -29,6 +29,7 @@ static GXRModeObj *rmode = NULL;
 
 static bool sync_pressed = false;
 static err_t bomb_err = ERR_OK;
+static s32_t quitState = 0;
 
 struct payload_info_t {
 	void *payload;
@@ -36,7 +37,17 @@ struct payload_info_t {
 	size_t remaining;
 } payload_info;
 
-static void SyncButton(u32 held)
+static void WiiPowerButton()
+{
+    quitState = 2;
+}
+
+static void WiiResetButton(u32 irq, void* ctx)
+{
+	quitState = 1;
+}
+
+static void WiiSyncButton(u32 held)
 {
 	sync_pressed = true;
 }
@@ -332,7 +343,7 @@ static err_t __bluebomb_accept_step2(void *arg,struct l2cap_pcb *l2cappcb,err_t 
 	return err;
 }
 
-s32 bluebomb_listenasync(struct l2cap_pcb **pcb, struct bd_addr *bdaddr)
+s32_t bluebomb_listenasync(struct l2cap_pcb **pcb, struct bd_addr *bdaddr)
 {
 	u32 level;
 	s32 err = ERR_OK;
@@ -358,26 +369,21 @@ error:
 	return err;
 }
 
-s32_t bluebomb_accept(s32 result, void *userdata)
+s32_t bluebomb_accept(s32_t result, void *userdata)
 {
-	err_t ret;
+	s32_t ret = ERR_OK;
 	struct l2cap_pcb **pcb = (struct l2cap_pcb **)userdata;
-
-	printf("Bluebomb ready. Press \x1b[38;5;160mSYNC\x1b[0m on the target console.\n");
-	printf("Waiting to accept...\n");
 
 	if((ret = bluebomb_listenasync(pcb, BD_ADDR_ANY)) != ERR_OK) {
 		fprintf(stderr, "bluebomb_accept: bluebomb_listenasync failed(%d)", ret);
+		return ret;
 	}
 
+	printf("Bluebomb ready. Press \x1b[38;5;160mSYNC\x1b[0m on the target console to connect.\n");
+	printf("Press \x1b[38;5;160mSYNC\x1b[0m on this console to cancel.\n");
+	printf("Waiting to accept...\n");
+
 	return ret;
-}
-
-s32_t quitState = 0;
-
-void WiiPowerPressed()
-{
-    quitState = 2;
 }
 
 struct stage0_addr_t {
@@ -560,6 +566,7 @@ enum APP_STATE {
 	APP_STATE_EXPLOIT_INIT,
 	APP_STATE_EXPLOIT_RUNNING,
 	APP_STATE_EXPLOIT_FINISHED,
+	APP_STATE_EXPLOIT_CANCELED,
 	APP_STATE_EXPLOIT_FAILED,
 };
 
@@ -592,7 +599,7 @@ int main(int argc, char **argv) {
 	xfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 
 	// Initialise the console, required for printf
-	CON_Init(xfb, 20, 20, rmode->fbWidth-20, rmode->xfbHeight-20, rmode->fbWidth*VI_DISPLAY_PIX_SZ);
+	CON_Init(xfb, 20, 20, rmode->fbWidth-40, rmode->xfbHeight-40, rmode->fbWidth*VI_DISPLAY_PIX_SZ);
 
 	// Set up the video registers with the chosen mode
 	VIDEO_Configure(rmode);
@@ -613,7 +620,8 @@ int main(int argc, char **argv) {
 	VIDEO_WaitVSync();
 	if(rmode->viTVMode&VI_NON_INTERLACE) VIDEO_WaitVSync();
 
-	SYS_SetPowerCallback(WiiPowerPressed);
+	SYS_SetPowerCallback(WiiPowerButton);
+	SYS_SetResetCallback(WiiResetButton);
 
 	// This function initialises the attached controllers
 	PAD_Init();
@@ -649,7 +657,7 @@ int main(int argc, char **argv) {
 			case APP_STATE_CONFIRM:
 				console_set_cursor_pos(6, 0);
 				printf("Exploit target chosen: %s\n", stage0_addrs[which_addr].name);
-				printf("Press \x1b[38;5;10mA\x1b[0m to turn off all connected Wii Remotes and begin the exploit process.\n");
+				printf("Press \x1b[38;5;10mA\x1b[0m to turn off all connected Wiimotes and begin the exploit process.\n");
 				printf("Press \x1b[38;5;9mB\x1b[0m to go back and choose a different target.\n");
 
 				if (wpad_pressed & WPAD_BUTTON_A) {
@@ -681,7 +689,7 @@ int main(int argc, char **argv) {
 				payload_info.remaining = sizeof(stage1_bin);
 		
 				BT_Init(bluebomb_accept, &sdp_pcb);
-				hci_sync_btn(SyncButton);
+				hci_sync_btn(WiiSyncButton);
 				state++;
 				break;
 			case APP_STATE_EXPLOIT_RUNNING:
@@ -694,7 +702,15 @@ int main(int argc, char **argv) {
 					WPAD_Init();
 					state++;
 				} else if (bomb_err != ERR_OK) {
-					printf("An error occurred: code %d.\n", bomb_err);
+					printf("\n\x1b[38;5;9mAn error occurred: code %d.\x1b[0\n", bomb_err);
+					printf("Press \x1b[38;5;10mA\x1b[0m to restart, or press \x1b[38;5;51mHOME\x1b[0m to quit.\n");
+					sdp_pcb = NULL;
+					BT_Shutdown();
+					WPAD_Init();
+					state = APP_STATE_EXPLOIT_FAILED;
+				} else if (sync_pressed) {
+					sync_pressed = false;
+					printf("\nCanceled by user. You may need to hard reset the target system.\n");
 					printf("Press \x1b[38;5;10mA\x1b[0m to restart, or press \x1b[38;5;51mHOME\x1b[0m to quit.\n");
 					sdp_pcb = NULL;
 					BT_Shutdown();
@@ -706,8 +722,18 @@ int main(int argc, char **argv) {
 				console_set_cursor_pos(24, 0);
 				printf("Congrats! Your Wii is now running homebrew.\n");
 				printf("...Your other Wii, that is.\n\n");
-				printf("Press \x1b[38;5;10mA\x1b[0m to restart, or press \x1b[38;5;51mHOME\x1b[0m to quit.\n");
+				printf("Press \x1b[38;5;10mA\x1b[0m to restart, or press \x1b[38;5;51mHOME\x1b[0m to quit.");
 				state++;
+				break;
+			case APP_STATE_EXPLOIT_CANCELED:
+				if (wpad_pressed & WPAD_BUTTON_A) {
+					console_clear_screen(2);
+					state = APP_STATE_CHOOSE;
+				} else if (wpad_pressed & WPAD_BUTTON_HOME) {
+					console_set_cursor_pos(6, 0);
+					console_clear_screen(0);
+					quitState = 1;
+				}
 				break;
 			case APP_STATE_EXPLOIT_FAILED:
 				if (wpad_pressed & WPAD_BUTTON_A) {
